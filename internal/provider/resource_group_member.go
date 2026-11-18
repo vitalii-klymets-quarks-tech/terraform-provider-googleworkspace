@@ -149,7 +149,21 @@ func resourceGroupMemberCreate(ctx context.Context, d *schema.ResourceData, meta
 		DeliverySettings: d.Get("delivery_settings").(string),
 	}
 
-	member, err := membersService.Insert(groupId, &memberObj).Do()
+	// Wrap Insert in a retry loop: when a group is created and members are added in the
+	// same apply, the group may not be consistent in GWS yet, causing a 404 on Insert.
+	// Returning a "timed out while waiting" error makes retryTimeDuration keep retrying.
+	var member *directory.Member
+	err = retryTimeDuration(ctx, d.Timeout(schema.TimeoutCreate), func() error {
+		var insertErr error
+		member, insertErr = membersService.Insert(groupId, &memberObj).Do()
+		if insertErr != nil {
+			if isNotFound(insertErr) {
+				return fmt.Errorf("timed out while waiting for group %s to be ready for member insertion: %s", groupId, insertErr)
+			}
+			return insertErr
+		}
+		return nil
+	})
 
 	// If we receive a 409 that the member already exists, ignore it, we'll import it next
 	if err != nil {
