@@ -149,15 +149,36 @@ func resourceGroupMemberCreate(ctx context.Context, d *schema.ResourceData, meta
 		DeliverySettings: d.Get("delivery_settings").(string),
 	}
 
-	member, err := membersService.Insert(groupId, &memberObj).Do()
+	// Wrap Insert in a retry loop: when a group is created and members are added in the
+	// same apply, the group may not be consistent in GWS yet, causing a 404 on Insert.
+	// Returning a "timed out while waiting" error makes retryTimeDuration keep retrying.
+	var member *directory.Member
+	err = retryTimeDuration(ctx, d.Timeout(schema.TimeoutCreate), func() error {
+		var insertErr error
+		member, insertErr = membersService.Insert(groupId, &memberObj).Do()
+		if insertErr != nil {
+			if isNotFound(insertErr) {
+				return fmt.Errorf("timed out while waiting for group %s to be ready for member insertion: %s", groupId, insertErr)
+			}
+			return insertErr
+		}
+		return nil
+	})
 
 	// If we receive a 409 that the member already exists, ignore it, we'll import it next
 	if err != nil {
 		return diag.FromErr(err)
 	}
 
+	// For external members (non-GWS users), the API may return an empty Id on Insert.
+	// Use email as the lookup key in that case so the resource ID is not empty.
+	memberKey := member.Id
+	if memberKey == "" {
+		memberKey = email
+	}
+
 	d.Set("member_id", member.Id)
-	d.SetId(fmt.Sprintf("groups/%s/members/%s", groupId, member.Id))
+	d.SetId(fmt.Sprintf("groups/%s/members/%s", groupId, memberKey))
 
 	// INSERT will respond with the Group Member that will be created, however, it is eventually consistent
 	// After INSERT, the etag is updated along with the Group Member,
@@ -173,7 +194,7 @@ func resourceGroupMemberCreate(ctx context.Context, d *schema.ResourceData, meta
 			return nil
 		}
 
-		newMember, retryErr := membersService.Get(groupId, member.Id).IfNoneMatch(cc.lastEtag).Do()
+		newMember, retryErr := membersService.Get(groupId, memberKey).IfNoneMatch(cc.lastEtag).Do()
 		if googleapi.IsNotModified(retryErr) {
 			cc.currConsistent += 1
 		} else if isNotFound(retryErr) {
@@ -216,7 +237,14 @@ func resourceGroupMemberRead(ctx context.Context, d *schema.ResourceData, meta i
 	groupId := d.Get("group_id").(string)
 	memberId := d.Get("member_id").(string)
 
-	member, err := membersService.Get(groupId, memberId).Do()
+	// If member_id is empty (e.g. state left by a failed create for an external member),
+	// fall back to looking up by email so the resource can self-heal on the next refresh.
+	lookupKey := memberId
+	if lookupKey == "" {
+		lookupKey = d.Get("email").(string)
+	}
+
+	member, err := membersService.Get(groupId, lookupKey).Do()
 	if err != nil {
 		return handleNotFoundError(err, d, d.Id())
 	}
@@ -229,7 +257,12 @@ func resourceGroupMemberRead(ctx context.Context, d *schema.ResourceData, meta i
 	d.Set("delivery_settings", member.DeliverySettings)
 	d.Set("member_id", member.Id)
 
-	d.SetId(fmt.Sprintf("groups/%s/members/%s", groupId, member.Id))
+	// Always rebuild the ID from the real member.Id so stale / empty IDs are corrected.
+	resolvedKey := member.Id
+	if resolvedKey == "" {
+		resolvedKey = member.Email
+	}
+	d.SetId(fmt.Sprintf("groups/%s/members/%s", groupId, resolvedKey))
 
 	return diags
 }
