@@ -153,7 +153,7 @@ func resourceGroupMemberCreate(ctx context.Context, d *schema.ResourceData, meta
 	// same apply, the group may not be consistent in GWS yet, causing a 404 on Insert.
 	// Returning a "timed out while waiting" error makes retryTimeDuration keep retrying.
 	var member *directory.Member
-	err = retryTimeDuration(ctx, d.Timeout(schema.TimeoutCreate), func() error {
+	err := retryTimeDuration(ctx, d.Timeout(schema.TimeoutCreate), func() error {
 		var insertErr error
 		member, insertErr = membersService.Insert(groupId, &memberObj).Do()
 		if insertErr != nil {
